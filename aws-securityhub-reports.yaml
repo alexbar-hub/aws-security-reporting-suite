@@ -1,0 +1,618 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Creates a lambda that generates an AWS SecurityHub repot once a week and sends an email with a link to download it. The link expires after 12 hours."
+
+Parameters:
+
+  SecurityHubS3Bucket:
+    Type: String
+    Description: "Name of the S3 bucket in which the output will be saved."
+    Default: aws-securityhub-reports
+
+  SecurityHubOACName:
+    Type: String
+    Description: "Name of the Origin Access Control."
+    Default: securityhub-report
+
+  SecurityHubKeyName:
+    Type: String
+    Description: "Name of the CloudFront Key."
+    Default: securityhub-report
+
+  SecurityHubEcondedPublicKey:
+    Type: String
+    Description: "The public key you created locally."
+    Default: |
+      -----BEGIN PUBLIC KEY-----
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      -----END PUBLIC KEY-----
+
+  SecurityHubKeyGroupName:
+    Type: String
+    Description: "Name of the CloudFront Key Group."
+    Default: securityhub-report
+
+  SecurityHubCachePolicyName:
+    Type: String
+    Description: "Name of the CloudFront Cache Policy."
+    Default: securityhub-report
+
+  SecurityHubLambda:
+    Type: String
+    Description: "Name of the lambda function that will generate the report."
+    Default: securityhub-reports
+
+  SecurityHubSNSTopic:
+    Type: String
+    Description: "Name of the SNS topic for notifications."
+    Default: securityhub-reports
+
+  SecurityHubSNSSubscription1:
+    Type: String
+    Description: "Email notification receiver."
+    Default: something@example.com
+
+  SecurityHubSNSSubscription2:
+    Type: String
+    Description: "Email notification receiver."
+    Default: something.else@example.com
+
+  SecurityHubSNSSubscription3:
+    Type: String
+    Description: "Slack endpoint URL."
+    Default: https://this.is.a.slack.endpoint
+
+  SecurityHubSNSTopicExceptions:
+    Type: String
+    Description: Name of the SNS topic for Lambda function exceptions
+    Default: securityhub-reports-exceptions
+
+  SecurityHubExceptionsSNSSubscription:
+    Type: String
+    Description: Slack/Jira webhook for Lambda function exceptions
+    Default: https://this.is.a.jira.endpoint
+
+  SecurityHubEventBridge:
+    Type: String
+    Description: "Event bridge rule to trigger the lambda function on a schedule."
+    Default: securityhub-reports
+
+  SecurityHubIAMRole:
+    Type: String
+    Description: "IAM role needed by the lambda function."
+    Default: securityhub-reports
+
+  SecurityHubCloudWatchGroupPrefix:
+    Type: String
+    Description: "CloudWatch Log Group prefix for the lambda function."
+    Default: /aws/lambda
+
+Resources:
+
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref SecurityHubS3Bucket
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: false
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      VersioningConfiguration:
+        Status: "Suspended"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: Delete-Incomplete-MPU-7Days
+            Status: Enabled
+            Prefix: ''
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: Expire and delete after 7 years
+            Status: Enabled
+            Prefix: ''
+            ExpirationInDays: 2555
+            NoncurrentVersionExpiration: 
+              NoncurrentDays: 1
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "AllowCloudFrontServicePrincipal"
+            Effect: Allow
+            Principal:
+              Service: "cloudfront.amazonaws.com"
+            Action:
+              - 's3:GetObject'
+            Resource:
+              - !Sub 'arn:aws:s3:::${S3Bucket}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceArn':
+                  Fn::Join:
+                    - "" 
+                    - 
+                      - !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/"
+                      - Fn::GetAtt:
+                        - "SecurityHubCloudfrontDistribution"
+                        - "Id"
+
+  SecurityHubOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Ref SecurityHubOACName
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SecurityHubCloudfrontKey:
+    Type: AWS::CloudFront::PublicKey
+    Properties:
+      PublicKeyConfig:
+        Name: !Ref SecurityHubKeyName
+        CallerReference: !Ref AWS::StackName
+        EncodedKey: !Ref SecurityHubEcondedPublicKey
+
+  SecurityHubCloudfrontKeyGroup:
+    Type: AWS::CloudFront::KeyGroup
+    Properties:
+      KeyGroupConfig: 
+        Name: !Ref SecurityHubKeyGroupName
+        Items:
+          - !Ref SecurityHubCloudfrontKey
+
+  SecurityHubCloudfrontCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Ref SecurityHubCachePolicyName
+        DefaultTTL: 60
+        MaxTTL: 60
+        MinTTL: 60
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+
+  SecurityHubCloudfrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - Id: !Sub "${SecurityHubS3Bucket}.s3.${AWS::Region}.amazonaws.com"
+            DomainName: !Sub "${SecurityHubS3Bucket}.s3.${AWS::Region}.amazonaws.com"
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !Ref SecurityHubOriginAccessControl
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub "${SecurityHubS3Bucket}.s3.${AWS::Region}.amazonaws.com"
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - HEAD
+            - GET
+          CachedMethods:
+            - HEAD
+            - GET
+          Compress: true
+          CachePolicyId: !GetAtt SecurityHubCloudfrontCachePolicy.Id
+          TrustedKeyGroups: 
+            - !GetAtt SecurityHubCloudfrontKeyGroup.Id
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_All
+
+  SnsTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        - Endpoint: !Ref SecurityHubSNSSubscription1
+          Protocol: "email"
+        - Endpoint: !Ref SecurityHubSNSSubscription2
+          Protocol: "email"
+        - Endpoint: !Ref SecurityHubSNSSubscription3
+          Protocol: "https" 
+      TopicName: !Ref SecurityHubSNSTopic
+  
+  SnsTopicExceptions:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        - Endpoint: !Ref SecurityHubExceptionsSNSSubscription
+          Protocol: "https"
+      TopicName: !Ref SecurityHubSNSTopicExceptions
+
+  MyReportsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: 
+        Fn::Join:
+          - ""
+          - 
+            - !Ref SecurityHubCloudWatchGroupPrefix
+            - "/"
+            - !Ref SecurityHubLambda
+      RetentionInDays: 90
+
+  IAMLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Ref SecurityHubIAMRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'lambda.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/AWSSecurityHubReadOnlyAccess'
+      Policies:
+      - PolicyName: SecurityHub-Reports-LambdaBasicExecutionRole
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: "logs:CreateLogGroup"
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource:
+              - !Sub 'arn:aws:logs:*:*:log-group:${SecurityHubCloudWatchGroupPrefix}/${SecurityHubLambda}:*'
+      - PolicyName: SecurityHub-Reports-SNS-Publish
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "sns:Publish"
+            Resource: "arn:aws:sns:*:*:*"
+      - PolicyName: SecurityHub-Reports-S3-Access
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: "VisualEditor0"
+            Effect: "Allow"
+            Action:
+              - "s3:PutObject"
+              - "s3:GetObject"
+              - "s3:ListBucketMultipartUploads"
+              - "s3:DeleteObjectVersion"
+              - "s3:ListBucketVersions"
+              - "s3:GetObjectAttributes"
+              - "s3:ListBucket"
+              - "s3:PutObjectTagging"
+              - "s3:DeleteObject"
+              - "s3:GetBucketAcl"
+              - "s3:ListMultipartUploadParts"
+            Resource: 
+              - !Sub 'arn:aws:s3:::${SecurityHubS3Bucket}/*'
+              - !Sub 'arn:aws:s3:::${SecurityHubS3Bucket}'
+          - Sid: "VisualEditor1"
+            Effect: "Allow"
+            Action:
+              - "s3:ListStorageLensConfigurations"
+              - "s3:ListAccessPointsForObjectLambda"
+              - "s3:ListAllMyBuckets"
+              - "s3:ListAccessPoints"
+              - "s3:ListJobs"
+              - "s3:ListMultiRegionAccessPoints"
+            Resource: "*"
+      - PolicyName: SecurityHub-Reports-Org-Access
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: "organizations:DescribeAccount"
+            Resource: "*"
+
+  LambdaSecurityHubReports:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Ref SecurityHubLambda
+      Description: "AWS function used to generate SecurityHub findings reports in S3 bucket. The report collects all data from SecurityHub"
+      Code:
+        ZipFile: | 
+          # Source of the initial work here: https://github.com/ykbryan/lambda-get-securityhub-findings
+
+          import json
+          import boto3
+          import botocore
+          import csv
+          import os
+
+          sns = boto3.client('sns')
+          securityhub = boto3.client('securityhub')
+          s3 = boto3.resource('s3')
+          org_client = boto3.client('organizations')  # AWS Organizations client to get account details
+
+          _filter = Filters={
+              'ProductName': [
+                  {
+                      'Value': 'Security Hub',
+                      'Comparison': 'EQUALS'
+                  }
+              ],
+              'ComplianceStatus': [
+                  {
+                      'Value': 'FAILED',
+                      'Comparison': 'EQUALS'
+                  }
+              ],
+              'RecordState': [
+                  {
+                      'Value': 'ACTIVE',
+                      'Comparison': 'EQUALS'
+                  }
+              ],
+              'WorkflowStatus': [
+                  {
+                      'Value': 'SUPPRESSED',
+                      'Comparison': 'NOT_EQUALS'
+                  }
+              ],
+              'WorkflowStatus': [
+                  {
+                      'Value': 'RESOLVED',
+                      'Comparison': 'NOT_EQUALS'
+                  }
+              ],
+            #  'GeneratorId': [
+            #      {
+            #          'Value': 'aws-foundation',
+            #          'Comparison': 'PREFIX'
+            #      }
+            #  ],
+          }
+          _sort = SortCriteria=[
+              {
+                  'Field': 'ComplianceStatus',
+                  'SortOrder': 'desc'
+              },
+              {
+                  'Field': 'SeverityNormalized',
+                  'SortOrder': 'desc'
+              }
+          ]
+
+          MAX_ITEMS=100
+
+          # Cache for account names to avoid redundant API calls
+          account_name_cache = {}
+
+          def get_account_name(account_id):
+              # Check cache first
+              if account_id in account_name_cache:
+                  return account_name_cache[account_id]
+              
+              try:
+                  response = org_client.describe_account(AccountId=account_id)
+                  account_name = response['Account']['Name']
+                  account_name_cache[account_id] = account_name  # Cache the account name
+                  return account_name
+              except Exception as e:
+                  print(f"Error fetching account name for {account_id}: {e}")
+                  return account_id
+
+          def lambda_handler(event, context):
+              # cannot seems to pass token = None into the get_findings() 
+              result = securityhub.get_findings(
+                Filters=_filter,
+                SortCriteria=_sort,
+                MaxResults=MAX_ITEMS
+              )
+
+              from datetime import datetime
+              current_datetime = datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
+              current_date = datetime.now().strftime('%d-%m-%Y')
+              current_time = datetime.now().strftime('%H:%M:%S')
+              print("Current date & time : ", current_datetime)
+              print("Current date : ", current_date)
+              print("Current time : ", current_time)
+              BUCKET_NAME=os.environ ['BucketName']
+              timestamped_key = current_datetime + "-SecurityHub_Findings.csv"
+              latest_key = "SecurityHub_Findings_Latest.csv"
+              date_time_key = "SecurityHub_Findings_Latest_Date_Time.csv"
+              
+              all_findings = []
+              
+              # Generate the first file that contains all data
+              with open("/tmp/securityhubreport.csv", "w", newline='', encoding='utf-8') as file:
+                  csv_file = csv.writer(file)
+                  
+                  keys = []
+                  count = 0
+                  while result:
+                      findings = result['Findings']
+                      current_batch = []
+                      for finding in findings: 
+                          # print("Finding Structure:", json.dumps(finding, indent=2))  # Print raw finding
+                          count += 1
+                          account_id = finding['AwsAccountId']
+                          account_name = get_account_name(account_id)
+                          item = {}
+                          item['AccountId'] = account_id
+                          item['AccountName'] = account_name
+                          item['Status'] = finding['Compliance']['Status']
+                          item['Severity'] = finding['Severity']['Label']
+                          item['WorkflowStatus'] = finding['Workflow']['Status']
+                          #item['Id'] = finding['ProductFields']['ControlId']
+                          item['Title'] = finding['Title']
+                          item['Description'] = finding['Description']
+                          item['ResourceType'] = finding['Resources'][0]['Type']
+                          item['ResourceId'] = finding['Resources'][0]['Id']
+                          item['Remediation'] = finding['Remediation']['Recommendation']['Url']
+                          item['Standard'] = finding['GeneratorId']
+                          item['FirstObserved'] = finding.get('FirstObservedAt', 'N/A')
+                          item['LastObserved'] = finding.get('LastObservedAt', 'N/A')
+                          item['Created'] = finding.get('CreatedAt', 'N/A')
+                          item['Updated'] = finding.get('UpdatedAt', 'N/A')
+                          #item['json'] = finding
+                          # print("Item to be added:", json.dumps(item, indent=2))  # Print the item
+                          current_batch.append(item)
+                          if not keys:
+                              keys = list(item.keys())
+                              csv_file.writerow(keys)
+
+                      for d in current_batch:
+                          csv_file.writerow(list(d.values()))
+
+                          all_findings.extend(current_batch)
+                          # print("All Findings so far:", json.dumps(all_findings, indent=2))  # Print current state of all_findings
+                      if "NextToken" in result:
+                          token = result['NextToken']
+                          result = securityhub.get_findings(Filters=_filter, SortCriteria=_sort, MaxResults=MAX_ITEMS, NextToken=token)
+                      else:
+                          result = None
+              
+              csv_binary = open('/tmp/securityhubreport.csv', 'rb').read()
+              
+              try:
+                  obj = s3.Object(BUCKET_NAME, timestamped_key)
+                  obj.put(Body=csv_binary, ContentType='text/csv')
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] == "404":
+                      print("The object does not exist.")
+                  else:
+                      raise
+              ### Debug
+              #print("All Findings:", json.dumps(all_findings, indent=2))
+
+              # Upload the second file with fixed name for Confluence
+              try:
+                  obj_latest = s3.Object(BUCKET_NAME, latest_key)
+                  obj_latest.put(Body=csv_binary, ContentType='text/csv')
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] == "404":
+                      print("The object does not exist.")
+                  else:
+                      raise
+
+              ### Generate the third file to get date/time execution in Confluence
+              with open("/tmp/date-time.csv", "w", newline='', encoding='utf-8') as date_file:
+                  csv_datetime = csv.writer(date_file)
+                  
+                  # Write a single line with the current execution date and time
+                  csv_datetime.writerow(["Latest UTC Execution Date", "Latest UTC Execution Time"])
+                  csv_datetime.writerow([current_date, current_time])
+
+              date_csv_binary = open('/tmp/date-time.csv', 'rb').read()
+              
+              # Upload the date-time CSV file
+              try:
+                  obj_datetime = s3.Object(BUCKET_NAME, date_time_key)
+                  obj_datetime.put(Body=date_csv_binary, ContentType='text/csv')
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] == "404":
+                      print("The object does not exist.")
+                  else:
+                      raise
+              s3client = boto3.client('s3')
+              try:
+                  download_url = s3client.generate_presigned_url(
+                      'get_object',
+                      Params={
+                          'Bucket': BUCKET_NAME,
+                          'Key': timestamped_key
+                      },
+                      ExpiresIn=43200
+                  )
+                  print('Download URL:', download_url)
+                  confluence_page_url = "https://confluence.page.url/securityhub"
+
+                  message = (
+                      f"Hey there, a new SecurityHub report is available.\n\n"
+                      f"Click on the following link to view it in Confluence and to download it: {confluence_page_url}.\n\n"
+                  )
+                  response = sns.publish(
+                      TopicArn = os.environ ['SnsTopicArn'] ,
+                      Subject = "New weekly SecurityHub report.",
+                      Message = message
+                      )
+                  return {
+                      "csv_link": download_url,
+                      "total": count
+                  }
+              except Exception as e:
+                  print ("Lambda execution failed: ", e)
+                  raise
+      Handler: "index.lambda_handler"
+      Environment:
+       Variables:
+          SnsTopicArn: !Ref SnsTopic
+          BucketName: !Ref S3Bucket
+      MemorySize: 512
+      Role: 
+        Fn::GetAtt:
+        - IAMLambdaRole
+        - Arn
+      Runtime: "python3.13"
+      Timeout: 600
+
+  LambdaVersionSecurityHubReports:
+      Type: AWS::Lambda::Version
+      DependsOn: LambdaSecurityHubReports
+      Properties:
+        FunctionName: !Ref SecurityHubLambda
+
+  LambdaDestinationExceptions:
+    Type: AWS::Lambda::EventInvokeConfig
+    DependsOn: LambdaSecurityHubReports
+    Properties:
+      DestinationConfig:
+          OnFailure:
+            Destination: !Ref SnsTopicExceptions
+      FunctionName: !Ref SecurityHubLambda
+      MaximumEventAgeInSeconds: 3600
+      MaximumRetryAttempts: 2
+      Qualifier: $LATEST
+
+  SecurityHubReportsRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Ref SecurityHubEventBridge
+      Description: "Triggers lambda function on a schedule to create Amazon SecurityHub reports"
+      EventBusName: default
+      ScheduleExpression: "cron(0 21 ? * 1 *)"
+      State: "ENABLED"
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+            - LambdaSecurityHubReports
+            - Arn
+          Id: "SecurityHubLambdaTarget"
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "LambdaSecurityHubReports"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+        - SecurityHubReportsRule
+        - Arn

@@ -1,0 +1,655 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Creates a lambda that generates an AWS Inspector repot once a week and sends an email with a link to download it. The link expires after 12 hours." 
+
+Parameters:
+  
+  InspectorS3Bucket:
+    Type: String
+    Description: "Name of the S3 bucket in which the output will be saved." 
+    Default: inspector-reports
+
+  InspectorOACName:
+    Type: String
+    Description: "Name of the Origin Access Control."
+    Default: inspector-report
+
+  InspectorKeyName:
+    Type: String
+    Description: "Name of the CloudFront Key."
+    Default: inspector-report
+
+  InspectorEcondedPublicKey:
+    Type: String
+    Description: "The public key you created locally."
+    Default: |
+      -----BEGIN PUBLIC KEY-----
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      -----END PUBLIC KEY-----
+
+  InspectorKeyGroupName:
+    Type: String
+    Description: "Name of the CloudFront Key Group."
+    Default: inspector-report
+
+  InspectorCachePolicyName:
+    Type: String
+    Description: "Name of the CloudFront Cache Policy."
+    Default: inspector-report
+
+  InspectorLambda:
+    Type: String
+    Description: "Name of the lambda function that will generate the report."
+    Default: inspector-reports
+
+  InspectorSNSTopic:
+    Type: String
+    Description: "Name of the SNS topic for notifications."
+    Default: inspector-reports
+
+  InspectorSNSSubscription1:
+    Type: String
+    Description: "Email notification receiver."
+    Default: something@example.com
+
+  InspectorSNSSubscription2:
+    Type: String
+    Description: "Email notification receiver."
+    Default: something.else@example.com
+
+  InspectorSNSSubscription3:
+    Type: String
+    Description: "Slack endpoint URL."
+    Default: https://this.is.a.slack.endpoint
+
+  InspectorSNSTopicExceptions:
+    Type: String
+    Description: Name of the SNS topic for Lambda function exceptions
+    Default: inspector-reports-exceptions
+
+  InspectorExceptionsSNSSubscription:
+    Type: String
+    Description: Slack/Jira webhook for Lambda function exceptions
+    Default: https://this.is.a.jira.endpoint
+
+  InspectorEventBridge:
+    Type: String
+    Description: "Event bridge rule to trigger the lambda function on a schedule."
+    Default: inspector-reports
+
+  InspectorIAMRole:
+    Type: String
+    Description: "IAM role needed by the lambda function."
+    Default: inspector-reports
+
+  InspectorCloudWatchGroupPrefix:
+    Type: String
+    Description: "CloudWatch Log Group prefix for the lambda function."
+    Default: /aws/lambda
+
+Resources:
+
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref InspectorS3Bucket
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: false
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      VersioningConfiguration:
+        Status: "Suspended"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: Transition to Glacier after 90 days
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: Delete-Incomplete-MPU-7Days
+            Status: Enabled
+            Prefix: ''
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: Expire and delete after 7 years
+            Status: Enabled
+            Prefix: ''
+            ExpirationInDays: 2555
+            NoncurrentVersionExpiration: 
+              NoncurrentDays: 1
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "AllowCloudFrontServicePrincipal"
+            Effect: Allow
+            Principal:
+              Service: "cloudfront.amazonaws.com"
+            Action:
+              - 's3:GetObject'
+            Resource:
+              - !Sub 'arn:aws:s3:::${S3Bucket}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceArn':
+                  Fn::Join:
+                    - "" 
+                    - 
+                      - !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/"
+                      - Fn::GetAtt:
+                        - "InspectorCloudfrontDistribution"
+                        - "Id"
+
+  InspectorOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Ref InspectorOACName
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  InspectorCloudfrontKey:
+    Type: AWS::CloudFront::PublicKey
+    Properties:
+      PublicKeyConfig:
+        Name: !Ref InspectorKeyName
+        CallerReference: !Ref AWS::StackName
+        EncodedKey: !Ref InspectorEcondedPublicKey
+
+  InspectorCloudfrontKeyGroup:
+    Type: AWS::CloudFront::KeyGroup
+    Properties:
+      KeyGroupConfig: 
+        Name: !Ref InspectorKeyGroupName
+        Items:
+          - !Ref InspectorCloudfrontKey
+
+  InspectorCloudfrontCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Ref InspectorCachePolicyName
+        DefaultTTL: 60
+        MaxTTL: 60
+        MinTTL: 60
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+
+  InspectorCloudfrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - Id: !Sub "${InspectorS3Bucket}.s3.${AWS::Region}.amazonaws.com"
+            DomainName: !Sub "${InspectorS3Bucket}.s3.${AWS::Region}.amazonaws.com"
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !Ref InspectorOriginAccessControl
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub "${InspectorS3Bucket}.s3.${AWS::Region}.amazonaws.com"
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - HEAD
+            - GET
+          CachedMethods:
+            - HEAD
+            - GET
+          Compress: true
+          CachePolicyId: !GetAtt InspectorCloudfrontCachePolicy.Id
+          TrustedKeyGroups: 
+            - !GetAtt InspectorCloudfrontKeyGroup.Id
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_All
+
+  SnsTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        - Endpoint: !Ref InspectorSNSSubscription1
+          Protocol: "email"
+        - Endpoint: !Ref InspectorSNSSubscription2
+          Protocol: "email"
+        - Endpoint: !Ref InspectorSNSSubscription3
+          Protocol: "https" 
+      TopicName: !Ref InspectorSNSTopic
+  
+  SnsTopicExceptions:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        - Endpoint: !Ref InspectorExceptionsSNSSubscription
+          Protocol: "https"
+      TopicName: !Ref InspectorSNSTopicExceptions
+
+  MyReportsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: 
+        Fn::Join:
+          - ""
+          - 
+            - !Ref InspectorCloudWatchGroupPrefix
+            - "/"
+            - !Ref InspectorLambda
+      RetentionInDays: 90
+
+  IAMLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Ref InspectorIAMRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'lambda.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/AWSSecurityHubReadOnlyAccess'
+      Policies:
+      - PolicyName: Inspector-Reports-LambdaBasicExecutionRole
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: "logs:CreateLogGroup"
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource:
+              - !Sub 'arn:aws:logs:*:*:log-group:${InspectorCloudWatchGroupPrefix}/${InspectorLambda}:*'
+      - PolicyName: Inspector-Reports-SNS-Publish
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "sns:Publish"
+            Resource: "arn:aws:sns:*:*:*"
+      - PolicyName: Inspector-Reports-S3-Access
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: "VisualEditor0"
+            Effect: "Allow"
+            Action:
+              - "s3:PutObject"
+              - "s3:GetObject"
+              - "s3:ListBucketMultipartUploads"
+              - "s3:DeleteObjectVersion"
+              - "s3:ListBucketVersions"
+              - "s3:GetObjectAttributes"
+              - "s3:ListBucket"
+              - "s3:PutObjectTagging"
+              - "s3:DeleteObject"
+              - "s3:GetBucketAcl"
+              - "s3:ListMultipartUploadParts"
+            Resource: 
+              - !Sub 'arn:aws:s3:::${InspectorS3Bucket}/*'
+              - !Sub 'arn:aws:s3:::${InspectorS3Bucket}'
+          - Sid: "VisualEditor1"
+            Effect: "Allow"
+            Action:
+              - "s3:ListStorageLensConfigurations"
+              - "s3:ListAccessPointsForObjectLambda"
+              - "s3:ListAllMyBuckets"
+              - "s3:ListAccessPoints"
+              - "s3:ListJobs"
+              - "s3:ListMultiRegionAccessPoints"
+            Resource: "*"
+      - PolicyName: Inspector-Reports-Org-Access
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: "organizations:DescribeAccount"
+            Resource: "*"
+
+  LambdaInspectorReports:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Ref InspectorLambda
+      Description: "AWS function used to generate Inspector findings reports in S3 bucket. The report collects all data from SecurityHub"
+      Code:
+        ZipFile: | 
+          # Source of the initial work here: https://github.com/ykbryan/lambda-get-securityhub-findings
+
+          import json
+          import boto3
+          import botocore
+          import csv
+          import os
+
+          sns = boto3.client('sns')
+          securityhub = boto3.client('securityhub')
+          s3 = boto3.resource('s3')
+          org_client = boto3.client('organizations')  # AWS Organizations client to get account details
+
+          _filter = {
+              'ProductName': [
+                  {
+                      'Value': 'Inspector',
+                      'Comparison': 'EQUALS'
+                  }
+              ],
+            #  'ComplianceStatus': [
+            #      {
+            #          'Value': 'FAILED',
+            #          'Comparison': 'EQUALS'
+            #      }
+            #  ],
+              'RecordState': [
+                  {
+                      'Value': 'ACTIVE',
+                      'Comparison': 'EQUALS'
+                  }
+              ],
+              'WorkflowStatus': [
+                  {
+                      'Value': 'SUPPRESSED',
+                      'Comparison': 'NOT_EQUALS'
+                  }
+              ],
+              'WorkflowStatus': [
+                  {
+                      'Value': 'RESOLVED',
+                      'Comparison': 'NOT_EQUALS'
+                  }
+              ],
+          #  'GeneratorId': [
+            #      {
+            #          'Value': 'aws-foundation',
+            #          'Comparison': 'PREFIX'
+            #      }
+            #  ],
+          }
+
+          _sort = [
+              {
+                  'Field': 'ComplianceStatus',
+                  'SortOrder': 'desc'
+              },
+              {
+                  'Field': 'SeverityNormalized',
+                  'SortOrder': 'desc'
+              }
+          ]
+
+          MAX_ITEMS = 100
+
+          # Cache for account names to avoid redundant API calls
+          account_name_cache = {}
+
+          def get_account_name(account_id):
+              # Check cache first
+              if account_id in account_name_cache:
+                  return account_name_cache[account_id]
+              
+              try:
+                  response = org_client.describe_account(AccountId=account_id)
+                  account_name = response['Account']['Name']
+                  account_name_cache[account_id] = account_name  # Cache the account name
+                  return account_name
+              except Exception as e:
+                  print(f"Error fetching account name for {account_id}: {e}")
+                  return account_id
+
+          def lambda_handler(event, context):
+              result = securityhub.get_findings(
+                Filters=_filter,
+                SortCriteria=_sort,
+                MaxResults=MAX_ITEMS
+              )
+
+              from datetime import datetime
+              current_datetime = datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
+              current_date = datetime.now().strftime('%d-%m-%Y')
+              current_time = datetime.now().strftime('%H:%M:%S')
+              print("Current date & time : ", current_datetime)
+              print("Current date : ", current_date)
+              print("Current time : ", current_time)
+              BUCKET_NAME = os.environ['BucketName'] 
+              timestamped_key = current_datetime + "-Inspector_Findings.csv"
+              latest_key = "Inspector_Findings_Latest.csv"
+              date_time_key = "Inspector_Findings_Latest_Date_Time.csv"
+              
+              all_findings = []
+              
+              # Generate the first file that contains all data
+              with open("/tmp/inspectorreport.csv", "w", newline='', encoding='utf-8') as file:
+                  csv_file = csv.writer(file)
+                  
+                  keys = []
+                  count = 0
+                  while result:
+                      findings = result['Findings']
+                      current_batch = []
+                      for finding in findings: 
+                          # print("Finding Structure:", json.dumps(finding, indent=2))  # Print raw finding
+                          count += 1
+                          account_id = finding['AwsAccountId']
+                          account_name = get_account_name(account_id)
+                          item = {}
+                          item['Standard'] = finding['GeneratorId']
+                          item['Severity'] = finding['Severity']['Label']
+                          item['Title'] = finding['Title']
+                          item['AccountId'] = account_id
+                          item['AccountName'] = account_name
+                          item['ResourceType'] = finding['Resources'][0]['Type']
+                          item['ResourceId'] = finding['Resources'][0]['Id']
+                          item['Description'] = finding['Description']
+                          item['FirstObserved'] = finding.get('FirstObservedAt', 'N/A')
+                          item['LastObserved'] = finding.get('LastObservedAt', 'N/A')
+                          item['Created'] = finding.get('CreatedAt', 'N/A')
+                          item['Updated'] = finding.get('UpdatedAt', 'N/A')
+                          item['json'] = finding 
+                          # print("Item to be added:", json.dumps(item, indent=2))  # Print the item
+                          current_batch.append(item)
+
+                          if not keys:
+                              keys = list(item.keys())
+                              csv_file.writerow(keys)
+
+                      for d in current_batch:
+                          csv_file.writerow(list(d.values()))
+
+                      all_findings.extend(current_batch)
+                      # print("All Findings so far:", json.dumps(all_findings, indent=2))  # Print current state of all_findings
+                      if "NextToken" in result:
+                          token = result['NextToken']
+                          result = securityhub.get_findings(Filters=_filter, SortCriteria=_sort, MaxResults=MAX_ITEMS, NextToken=token)
+                      else:
+                          result = None
+              
+              csv_binary = open('/tmp/inspectorreport.csv', 'rb').read()
+              
+              # Upload the first file
+              try:
+                  obj = s3.Object(BUCKET_NAME, timestamped_key)
+                  obj.put(Body=csv_binary, ContentType='text/csv')
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] == "404":
+                      print("The object does not exist.")
+                  else:
+                      raise
+
+              ### Debug
+              #print("All Findings:", json.dumps(all_findings, indent=2))
+
+              ### Generate the second file with fixed name for Confluence
+              with open("/tmp/inspectorlatest.csv", "w", newline='', encoding='utf-8') as latest_file:
+                  csv_latest = csv.writer(latest_file)
+                  
+                  keys = []
+                  count = 0
+                  for finding in all_findings:
+                      account_id = finding['AccountId']
+                      account_name = finding['AccountName']
+                      item = {}
+                      #item['Standard'] = finding['Standard']
+                      item['AccountId'] = account_id
+                      item['AccountName'] = account_name
+                      item['Severity'] = finding['Severity']
+                      item['Title'] = finding['Title']
+                      item['Description'] = finding['Description']
+                      item['ResourceType'] = finding['ResourceType']
+                      item['ResourceId'] = finding['ResourceId']
+                      item['FirstObserved'] = finding.get('FirstObserved', 'N/A')
+                      item['LastObserved'] = finding.get('LastObserved', 'N/A')
+                      item['Created'] = finding.get('Created', 'N/A')
+                      item['Updated'] = finding.get('Updated', 'N/A')
+                      # item['json'] = finding['json']
+                      
+                      if not keys:
+                          keys = list(item.keys())
+                          csv_latest.writerow(keys)
+                      
+                      csv_latest.writerow(list(item.values()))
+              
+              latest_csv_binary = open('/tmp/inspectorlatest.csv', 'rb').read()
+              
+              # Upload the second file with fixed name for Confluence
+              try:
+                  obj_latest = s3.Object(BUCKET_NAME, latest_key)
+                  obj_latest.put(Body=latest_csv_binary, ContentType='text/csv')
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] == "404":
+                      print("The object does not exist.")
+                  else:
+                      raise
+
+              ### Generate the third file to get date/time execution in Confluence
+              with open("/tmp/date-time.csv", "w", newline='', encoding='utf-8') as date_file:
+                  csv_datetime = csv.writer(date_file)
+                  
+                  # Write a single line with the current execution date and time
+                  csv_datetime.writerow(["Latest UTC Execution Date", "Latest UTC Execution Time"])
+                  csv_datetime.writerow([current_date, current_time])
+
+              date_csv_binary = open('/tmp/date-time.csv', 'rb').read()
+              
+              # Upload the date-time CSV file
+              try:
+                  obj_datetime = s3.Object(BUCKET_NAME, date_time_key)
+                  obj_datetime.put(Body=date_csv_binary, ContentType='text/csv')
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] == "404":
+                      print("The object does not exist.")
+                  else:
+                      raise
+
+              s3client = boto3.client('s3')
+              try:
+                  download_url = s3client.generate_presigned_url(
+                      'get_object',
+                      Params={
+                          'Bucket': BUCKET_NAME,
+                          'Key': timestamped_key
+                      },
+                      ExpiresIn=43200
+                  )
+                  print('Download URL:', download_url)
+                  confluence_page_url = "https://confluence.page.url/inspector"
+                  
+                  message = (
+                      f"Hey there, a new Inspector report is available.\n\n"
+                      f"Click on the following link to view it in Confluence and to download it: {confluence_page_url}.\n\n"
+                  )
+                  response = sns.publish(
+                      TopicArn=os.environ['SnsTopicArn'],
+                      Subject="New weekly Inspector report.",
+                      Message=message
+                  )
+                  return {
+                      "csv_link": download_url,
+                      "total": count
+                  }
+              except Exception as e:
+                  print ("Lambda execution failed: ", e)
+                  raise
+      Handler: "index.lambda_handler"
+      Environment:
+       Variables:
+          SnsTopicArn: !Ref SnsTopic
+          BucketName: !Ref S3Bucket
+      MemorySize: 2048
+      Role: 
+        Fn::GetAtt:
+        - IAMLambdaRole
+        - Arn
+      Runtime: "python3.13"
+      Timeout: 600
+
+  LambdaVersionInspectorReports:
+      Type: AWS::Lambda::Version
+      DependsOn: LambdaInspectorReports
+      Properties:
+        FunctionName: !Ref InspectorLambda
+
+  LambdaDestinationExceptions:
+    Type: AWS::Lambda::EventInvokeConfig
+    DependsOn: LambdaInspectorReports
+    Properties:
+      DestinationConfig:
+          OnFailure:
+            Destination: !Ref SnsTopicExceptions
+      FunctionName: !Ref InspectorLambda
+      MaximumEventAgeInSeconds: 3600
+      MaximumRetryAttempts: 2
+      Qualifier: $LATEST
+
+  InspectorReportsRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Ref InspectorEventBridge
+      Description: "Triggers lambda function on a schedule to create Amazon Inspector reports"
+      EventBusName: default
+      ScheduleExpression: "cron(10 21 ? * 1 *)"
+      State: "ENABLED"
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+            - LambdaInspectorReports
+            - Arn
+          Id: "InspectorLambdaTarget"
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "LambdaInspectorReports"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+        - InspectorReportsRule
+        - Arn
