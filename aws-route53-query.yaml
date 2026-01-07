@@ -1,0 +1,374 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Creates a lambda that generates Route53 repot once a week and sends an email with a link valid for 12 hours to download it to multiple recipients."
+
+Parameters:
+  
+  Route53S3Bucket:
+    Type: String
+    Description: "S3 bucket name."
+    Default: aws-route53-reports
+
+  CrossAccountIAMRole:
+    Type: String
+    Description: "Role name created by the aws-route53-query-basic-iam-grants.yaml template."
+    Default: aws-route53-reports-iam-role-name
+
+  Route53Lambda:
+    Type: String
+    Description: "Lambda name."
+    Default: aws-route53-reports
+
+  Route53SNSTopic:
+    Type: String
+    Description: "SNS topic name."
+    Default: aws-route53-reports
+
+  Route53SNSSubscription1:
+    Type: String
+    Description: "Email subscription 1."
+    Default: email1@example.com
+
+  Route53SNSSubscription2:
+    Type: String
+    Description: "Email subscription 2."
+    Default: email2@example.com
+
+  Route53SNSSubscription3:
+    Type: String
+    Description: "Email subscription 3."
+    Default: email3@example.com
+
+  Route53EventBridge:
+    Type: String
+    Description: "EventBridge rule name"
+    Default: aws-route53-reports
+
+  Route53IAMRole:
+    Type: String
+    Description: "IAM Role name in the audit account."
+    Default: aws-route53-reports
+
+  Route53CloudWatchGroup:
+    Type: String
+    Description: "CloudWatch Log Group prefix for the lambda function."
+    Default: /aws/lambda
+
+Resources:
+
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref Route53S3Bucket
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: false
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      VersioningConfiguration:
+        Status: "Suspended"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: Transition to Glacier after 90 days
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: Delete-Incomplete-MPU-7Days
+            Status: Enabled
+            Prefix: ''
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: Expire and delete after 5 years
+            Status: Enabled
+            Prefix: ''
+            ExpirationInDays: 1825
+            NoncurrentVersionExpiration: 
+              NoncurrentDays: 1
+
+  SnsTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        - Endpoint: !Ref Route53SNSSubscription1
+          Protocol: "email"
+        - Endpoint: !Ref Route53SNSSubscription2
+          Protocol: "email"
+        - Endpoint: !Ref Route53SNSSubscription3
+          Protocol: "email"
+      TopicName: !Ref Route53SNSTopic
+
+  IAMLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Ref Route53IAMRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'lambda.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+      - PolicyName: Route53-Reports-LambdaBasicExecutionRole
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: "logs:CreateLogGroup"
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource:
+              - !Sub 'arn:aws:logs:*:*:log-group:${Route53CloudWatchGroup}/${Route53Lambda}:*'
+      - PolicyName: Route53-Reports-SNS-Publish
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "sns:Publish"
+            Resource: "arn:aws:sns:*:*:*"
+      - PolicyName: Route53-Reports-ReadOnly
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "route53:ListHostedZones"
+              - "route53:ListResourceRecordSets"
+            Resource: "*"
+      - PolicyName: Route53-Reports-Org-ListAccounts
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "organizations:ListAccounts"
+            Resource: "*"
+      - PolicyName: Route53-Reports-STS-AssumeRole
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Resource:
+              - !Sub 'arn:aws:iam::*:role/${CrossAccountIAMRole}'
+      - PolicyName: Route53-Reports-S3-Access
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: "VisualEditor0"
+            Effect: "Allow"
+            Action:
+              - "s3:PutObject"
+              - "s3:GetObject"
+              - "s3:ListBucketMultipartUploads"
+              - "s3:DeleteObjectVersion"
+              - "s3:ListBucketVersions"
+              - "s3:GetObjectAttributes"
+              - "s3:ListBucket"
+              - "s3:PutObjectTagging"
+              - "s3:DeleteObject"
+              - "s3:GetBucketAcl"
+              - "s3:ListMultipartUploadParts"
+            Resource: 
+              - !Sub 'arn:aws:s3:::${Route53S3Bucket}/*'
+              - !Sub 'arn:aws:s3:::${Route53S3Bucket}'
+          - Sid: "VisualEditor1"
+            Effect: "Allow"
+            Action:
+              - "s3:ListStorageLensConfigurations"
+              - "s3:ListAccessPointsForObjectLambda"
+              - "s3:ListAllMyBuckets"
+              - "s3:ListAccessPoints"
+              - "s3:ListJobs"
+              - "s3:ListMultiRegionAccessPoints"
+            Resource: "*"
+
+  MyReportsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName:
+        Fn::Join:
+          - ""
+          - 
+            - !Ref Route53CloudWatchGroup
+            - "/"
+            - !Ref Route53Lambda
+      RetentionInDays: 90
+
+  LambdaRoute53Reports:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Ref Route53Lambda
+      Description: "AWS function used to generate Route53 findings reports in S3 bucket. The report collects all data from Route53"
+      Code:
+        ZipFile: | 
+          import boto3
+          import json
+          import zipfile
+          import io
+          import os
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              # Create an STS client
+              sts_client = boto3.client('sts')
+
+              # Use the AWS Organizations API to list accounts
+              organizations_client = boto3.client('organizations')
+
+              # Get the current date and time in YYYYMMDD-HHMMSS format
+              current_datetime = datetime.now().strftime('%Y%m%d-%H%M%S')
+
+              # Create a file name prefix based on the current date and time
+              file_name_prefix = f"{current_datetime}_record_sets"
+
+              # Initialize an in-memory buffer for the zip file
+              zip_buffer = io.BytesIO()
+
+              # Create a ZipFile object
+              with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                  # Use the AWS Organizations API to list accounts
+                  accounts = []
+
+                  paginator = organizations_client.get_paginator('list_accounts')
+                  for page in paginator.paginate():
+                      accounts.extend(page['Accounts'])
+
+                  # Print the list of all AWS Organization accounts
+                  print("List of AWS Organization accounts:")
+                  for account in accounts:
+                      print(f"Account Name: {account['Name']}")
+                      print(f"Account ID: {account['Id']}")
+                      print("-" * 30)
+
+                      account_id = account['Id']
+
+                      # Construct the role ARN for assuming the role in the account
+                      role_arn = f'arn:aws:iam::{account_id}:role/os.environ ['IAMRoleArn']'
+                      role_session_name = 'AssumedRoleSession'
+
+                      # Assume the role in the account
+                      response = sts_client.assume_role(
+                          RoleArn=role_arn,
+                          RoleSessionName=role_session_name
+                      )
+            
+                      # Get temporary credentials
+                      credentials = response['Credentials']
+                      access_key = credentials['AccessKeyId']
+                      secret_key = credentials['SecretAccessKey']
+                      session_token = credentials['SessionToken']
+              
+                      # Create a Route 53 client using the temporary credentials
+                      route53_client = boto3.client(
+                          'route53',
+                          aws_access_key_id=access_key,
+                          aws_secret_access_key=secret_key,
+                          aws_session_token=session_token
+                      )
+              
+                      # List hosted zones
+                      hosted_zones_response = route53_client.list_hosted_zones()
+              
+                      # Loop through each hosted zone
+                      for hosted_zone in hosted_zones_response['HostedZones']:
+                          zone_id = hosted_zone['Id']
+                          zone_name = hosted_zone['Name']
+                          record_sets_response = route53_client.list_resource_record_sets(
+                              HostedZoneId=zone_id
+                          )
+              
+                          # Create a directory structure for the account and hosted zone
+                          directory_path = f"{account_id}/{zone_id}-{zone_name}/"
+              
+                          # Loop through each record set in the hosted zone
+                          for record_set in record_sets_response['ResourceRecordSets']:
+                              record_set_name = record_set['Name']
+                              # Create a file name based on the record set name
+                              file_name = f"{record_set_name}.json"
+                              full_file_path = directory_path + file_name
+              
+                              # Convert the record set to a JSON string
+                              record_set_json = json.dumps(record_set, indent=4, default=str)
+              
+                              # Convert the JSON string to bytes using UTF-8 encoding
+                              record_set_bytes = record_set_json.encode('utf-8')
+              
+                              # Write record set details as bytes to a file in the zip buffer
+                              with zip_file.open(full_file_path, 'w') as json_file:
+                                  json_file.write(record_set_bytes)
+
+              # Upload the zip buffer to S3
+              s3_client = boto3.client('s3')
+              bucket_name = os.environ ['BucketName']
+              zip_buffer.seek(0)
+
+              # Use the file name prefix when uploading to S3
+              zip_file_name = f"{file_name_prefix}.zip"
+              s3_client.upload_fileobj(zip_buffer, bucket_name, zip_file_name)
+
+              # Get the URL of the uploaded object with a 12-hour expiration time
+              expiration_time = 60 * 60 * 12  # 12 hours in seconds
+              s3_url = s3_client.generate_presigned_url(
+                  'get_object',
+                  Params={'Bucket': bucket_name, 'Key': zip_file_name},
+                  ExpiresIn=expiration_time
+              )
+
+              # Send an SNS notification with the S3 URL
+              sns_client = boto3.client('sns')
+              topic_arn = os.environ ['SnsTopicArn']
+              sns_message = f"Hey there, a new Route53 export has been generated and the zip file is available at: {s3_url}. This link is valid for 12 hours."
+              sns_client.publish(TopicArn=topic_arn, Message=sns_message)
+
+              print("Process complete.")
+      Handler: "index.lambda_handler"
+      Environment:
+       Variables:
+          SnsTopicArn: !Ref SnsTopic
+          BucketName: !Ref S3Bucket
+          IAMRoleArn: !Ref Route53IAMRole
+      MemorySize: 512
+      Role: 
+        Fn::GetAtt:
+        - IAMLambdaRole
+        - Arn
+      Runtime: "python3.10"
+      Timeout: 300
+
+  Route53ReportsRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Ref Route53EventBridge
+      Description: "Triggers lambda function on a schedule to create Route53 reports"
+      EventBusName: default
+      ScheduleExpression: "cron(00 21 ? * 5 *)"
+      State: "ENABLED"
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+            - LambdaRoute53Reports
+            - Arn
+          Id: "Route53LambdaTarget"
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "LambdaRoute53Reports"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+        - Route53ReportsRule
+        - Arn

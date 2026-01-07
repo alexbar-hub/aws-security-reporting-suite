@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Used by a lambda in the management account to query Route53 and generate a report."
+
+Parameters:
+  
+  IAMLambdaRoleRoute53Query:
+    Type: String
+    Description: "IAM Role name."
+    Default: aws-route53-reports-iam-role-name
+  
+  IAMLambdaPolicyRoute53Query:
+    Type: String
+    Description: "IAM Policy name."
+    Default: aws-route53-reports-iam-policy-name
+
+  ManagementAccount:
+    Type: String
+    Description: "Account ID of the account that will run the lambda function, the audit account."
+    Default: 123456789012
+
+Resources:
+
+  IAMLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Ref IAMLambdaRoleRoute53Query
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS:
+              Fn::Join:
+                - ""
+                - 
+                  - "arn:aws:iam::"
+                  - !Ref ManagementAccount
+                  - ":root"
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+      - PolicyName: !Ref IAMLambdaPolicyRoute53Query
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "route53:ListHostedZones"
+              - "route53:ListResourceRecordSets"
+            Resource: "*"
