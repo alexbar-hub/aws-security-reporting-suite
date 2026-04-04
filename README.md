@@ -35,29 +35,32 @@ This solution deploys an end-to-end serverless solution to audit an AWS Organiza
 * **Extraction:** Data is being extracted from AWS Security Hub CSPM and Route 53:
   *  `aws-securityhub-reports.yaml`: Queries SecurityHub CSPM for findings where the `Product Name` is specifically filtered for `SecurityHub`
   *  `aws-inspector-reports.yaml`: Queries SecurityHub CSPM for findings where the `Product Name` is specifically filtered for `Inspector`
+  *  `aws-guardduty-reports.yaml`: Queries SecurityHub CSPM for findings where the `Product Name` is specifically filtered for `GuardDuty`
+  *  `aws-iam-access-analyzer-reports.yaml`: Queries SecurityHub CSPM for findings where the `Product Name` is specifically filtered for `IAM Access Analyzer`
   *  `aws-route53-query.yaml`: Audits the AWS Organization to create an inventory of all Route 53 hosted zones and record sets.
 * **Storage & Formatting:** 
-  * SecurityHub CSPM findings are converted to CSV for easy viewing, and are stored in an S3 bucket.
+  * SecurityHub CSPM data is converted to CSV for easy viewing, and are stored in an S3 bucket.
   * Route 53 data is packaged into a zip file for logging, and is stored in an S3 bucket.
 * **Security:** All reports are stored in hardened S3 buckets. Access is restricted via CloudFront (OAI/OAC), blocking direct S3 public access.
 * **Delivery:** Generates Signed URLs ensuring that sensitive infrastructure data is only accessible to authorized stakeholders.
 
 ## 📐 Design
 ### Assumptions
-* An **Audit Account** is configured as the Delegated Administrator for both Security Hub and Amazon Inspector.
-* Security Hub is configured with **Cross-Region Aggregation**.
+* An **Audit Account** is configured as the Delegated Administrator for Security Hub CSPM, Amazon Inspector, GuardDuty, and IAM Access Analyzer.
+* Security Hub CSPM is configured with **Cross-Region Aggregation**.
 
 ### SecurityHub CSPM Reports Architecture
-![SecurityHub CSPM Reports Design](images/aws-security-reporting.drawio.png)
+![SecurityHub CSPM Reports Design](images/aws-security-reporting-suite.drawio.png)
 *Figure 1: SecurityHub CSPM Reports Design*
 
-[Design Source - draw.io](https://github.com/alexbar-hub/aws-security-reporting/blob/main/images/aws-security-reporting.drawio)
+[Design Source - draw.io](https://github.com/alexbar-hub/aws-security-reporting-suite/blob/main/images/aws-security-reporting-suite.drawio)
 
 ## 🛠️ Resources
 All templates create the following resources:
 * **S3 Bucket:** Stores reports with an automated Lifecycle Policy.
 * **AWS Lambda:** Extracts findings and generates the CSV/ZIP files.
-* **Amazon SNS:** Notifies teams via Email/HTTPS when new reports are available.
+* **First Amazon SNS:** Notifies teams via Email and Slack (https webhook) when new reports are available.
+* **Second Amazon SNS:** Notifies teams by raising a Jira ticket (https webhook) for auditing purposes in case of a lambda failure.
 * **EventBridge Rule:** Triggers the generation logic on a schedule.
 * **CloudFront:** Distribution with custom key, group, and cache policy (SecurityHub CSPM reports only).
 

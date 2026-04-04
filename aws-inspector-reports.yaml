@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Creates a lambda that generates an AWS Inspector repot once a week and sends an email with a link to download it. The link expires after 12 hours." 
+Description: "Creates a lambda that generates an Amazon Inspector repot on a schedule. The data is extracted from SecurityHub CSPM. The report is shared via CloudFront and browsable in Confluence."
 
 Parameters:
   
@@ -11,12 +11,12 @@ Parameters:
   InspectorOACName:
     Type: String
     Description: "Name of the Origin Access Control."
-    Default: inspector-report
+    Default: inspector-reports
 
   InspectorKeyName:
     Type: String
     Description: "Name of the CloudFront Key."
-    Default: inspector-report
+    Default: inspector-reports
 
   InspectorEcondedPublicKey:
     Type: String
@@ -35,12 +35,12 @@ Parameters:
   InspectorKeyGroupName:
     Type: String
     Description: "Name of the CloudFront Key Group."
-    Default: inspector-report
+    Default: inspector-reports
 
   InspectorCachePolicyName:
     Type: String
     Description: "Name of the CloudFront Cache Policy."
-    Default: inspector-report
+    Default: inspector-reports
 
   InspectorLambda:
     Type: String
@@ -69,12 +69,12 @@ Parameters:
 
   InspectorSNSTopicExceptions:
     Type: String
-    Description: Name of the SNS topic for Lambda function exceptions
+    Description: "Name of the SNS topic for Lambda function exceptions."
     Default: inspector-reports-exceptions
 
   InspectorExceptionsSNSSubscription:
     Type: String
-    Description: Slack/Jira webhook for Lambda function exceptions
+    Description: "Jira webhook for Lambda function exceptions."
     Default: https://this.is.a.jira.endpoint
 
   InspectorEventBridge:
@@ -132,7 +132,7 @@ Resources:
   S3BucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
-      Bucket: !Ref S3Bucket
+      Bucket: !Sub "${S3Bucket}-${AWS::AccountId}-${AWS::Region}"
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -143,17 +143,27 @@ Resources:
             Action:
               - 's3:GetObject'
             Resource:
-              - !Sub 'arn:aws:s3:::${S3Bucket}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}/*'
             Condition:
               StringEquals:
                 'aws:SourceArn':
                   Fn::Join:
                     - "" 
                     - 
-                      - !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/"
+                      - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/"
                       - Fn::GetAtt:
                         - "InspectorCloudfrontDistribution"
                         - "Id"
+          - Sid: "AllowSSLRequestsOnly"
+            Effect: Deny
+            Action: s3:*
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+            Principal: '*'
 
   InspectorOriginAccessControl:
     Type: AWS::CloudFront::OriginAccessControl
@@ -288,7 +298,7 @@ Resources:
               - "logs:CreateLogStream"
               - "logs:PutLogEvents"
             Resource:
-              - !Sub 'arn:aws:logs:*:*:log-group:${InspectorCloudWatchGroupPrefix}/${InspectorLambda}:*'
+              - !Sub 'arn:${AWS::Partition}:logs:*:*:log-group:${InspectorCloudWatchGroupPrefix}/${InspectorLambda}:*'
       - PolicyName: Inspector-Reports-SNS-Publish
         PolicyDocument:
           Version: "2012-10-17"
@@ -316,8 +326,8 @@ Resources:
               - "s3:GetBucketAcl"
               - "s3:ListMultipartUploadParts"
             Resource: 
-              - !Sub 'arn:aws:s3:::${InspectorS3Bucket}/*'
-              - !Sub 'arn:aws:s3:::${InspectorS3Bucket}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${InspectorS3Bucket}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${InspectorS3Bucket}'
           - Sid: "VisualEditor1"
             Effect: "Allow"
             Action:
@@ -379,9 +389,7 @@ Resources:
                   {
                       'Value': 'SUPPRESSED',
                       'Comparison': 'NOT_EQUALS'
-                  }
-              ],
-              'WorkflowStatus': [
+                  },
                   {
                       'Value': 'RESOLVED',
                       'Comparison': 'NOT_EQUALS'
@@ -457,9 +465,13 @@ Resources:
                       current_batch = []
                       for finding in findings: 
                           # print("Finding Structure:", json.dumps(finding, indent=2))  # Print raw finding
+                          resources = finding.get('Resources', [])
+                          if not resources:
+                              continue
                           count += 1
                           account_id = finding['AwsAccountId']
                           account_name = get_account_name(account_id)
+                          resource = resources[0]
                           item = {}
                           item['Standard'] = finding['GeneratorId']
                           item['Severity'] = finding['Severity']['Label']
@@ -468,6 +480,11 @@ Resources:
                           item['AccountName'] = account_name
                           item['ResourceType'] = finding['Resources'][0]['Type']
                           item['ResourceId'] = finding['Resources'][0]['Id']
+                          tags = resource.get('Tags', {})
+                          resource_name = tags.get('Name') or tags.get('name')
+                          if not resource_name:
+                              resource_name = resource.get('Details', {}).get('Other', {}).get('Name', 'No Name tag, see ARN.')
+                          item['ResourceName'] = resource_name
                           item['Description'] = finding['Description']
                           item['FirstObserved'] = finding.get('FirstObservedAt', 'N/A')
                           item['LastObserved'] = finding.get('LastObservedAt', 'N/A')
@@ -512,25 +529,8 @@ Resources:
                   csv_latest = csv.writer(latest_file)
                   
                   keys = []
-                  count = 0
-                  for finding in all_findings:
-                      account_id = finding['AccountId']
-                      account_name = finding['AccountName']
-                      item = {}
-                      #item['Standard'] = finding['Standard']
-                      item['AccountId'] = account_id
-                      item['AccountName'] = account_name
-                      item['Severity'] = finding['Severity']
-                      item['Title'] = finding['Title']
-                      item['Description'] = finding['Description']
-                      item['ResourceType'] = finding['ResourceType']
-                      item['ResourceId'] = finding['ResourceId']
-                      item['FirstObserved'] = finding.get('FirstObserved', 'N/A')
-                      item['LastObserved'] = finding.get('LastObserved', 'N/A')
-                      item['Created'] = finding.get('Created', 'N/A')
-                      item['Updated'] = finding.get('Updated', 'N/A')
-                      # item['json'] = finding['json']
-                      
+                  for item in all_findings:
+
                       if not keys:
                           keys = list(item.keys())
                           csv_latest.writerow(keys)
@@ -588,7 +588,7 @@ Resources:
                   )
                   response = sns.publish(
                       TopicArn=os.environ['SnsTopicArn'],
-                      Subject="New weekly Inspector report.",
+                      Subject="New Inspector report.",
                       Message=message
                   )
                   return {
@@ -635,7 +635,7 @@ Resources:
       Name: !Ref InspectorEventBridge
       Description: "Triggers lambda function on a schedule to create Amazon Inspector reports"
       EventBusName: default
-      ScheduleExpression: "cron(10 21 ? * 1 *)"
+      ScheduleExpression: "cron(10 21 * * ? *)"
       State: "ENABLED"
       Targets:
         - Arn:

@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2026-04-04
+
+### Added
+- **GuardDuty Module:** Added aws-guardduty-reports.yaml to extract findings filtered by `Product Name: GuardDuty`.
+- **IAM Access Analyzer Module:** Added aws-guardduty-reports.yaml to extract findings filtered by `Product Name: IAM Access Analyzer`.
+
+### Changed
+- **Documentation:** Updated README.
+- **Modules:** Minor updates for consistency.
+- **Design diagram:** Added Jira ticket notification for auditing purposes.
+
+---
+
 ## [1.1.0] - 2026-01-07
 
 ### Added

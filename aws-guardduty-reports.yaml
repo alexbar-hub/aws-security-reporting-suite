@@ -1,0 +1,663 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Creates a lambda that generates GuardDuty repot on a schedule. The data is extracted from SecurityHub CSPM. The report is shared via CloudFront and browsable in Confluence"
+
+Parameters:
+  
+  GuardDutyS3Bucket:
+    Type: String
+    Description: "Name of the S3 bucket in which the output will be saved."
+    Default: guardduty-reports
+
+  GuardDutyOACName:
+    Type: String
+    Description: "Name of the Origin Access Control."
+    Default: guardduty-reports
+
+  GuardDutyKeyName:
+    Type: String
+    Description: "Name of the CloudFront Key."
+    Default: guardduty-reports
+
+  GuardDutyEcondedPublicKey:
+    Type: String
+    Description: "The public key you created locally."
+    Default: |
+      -----BEGIN PUBLIC KEY-----
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      SomethingSomethingSomething
+      -----END PUBLIC KEY-----
+
+  GuardDutyKeyGroupName:
+    Type: String
+    Description: "Name of the CloudFront Key Group."
+    Default: guardduty-reports
+
+  GuardDutyCachePolicyName:
+    Type: String
+    Description: "Name of the CloudFront Cache Policy."
+    Default: guardduty-reports
+
+  GuardDutyLambda:
+    Type: String
+    Description: "Name of the lambda function that will generate the report."
+    Default: guardduty-reports
+
+  GuardDutySNSTopic:
+    Type: String
+    Description: "Name of the SNS topic for notifications."
+    Default: guardduty-reports
+
+  GuardDutySNSSubscription1:
+    Type: String
+    Description: "Email notification receiver."
+    Default: something@example.com
+
+  GuardDutySNSSubscription2:
+    Type: String
+    Description: "Email notification receiver."
+    Default: something@example.com
+
+  GuardDutySNSSubscription3:
+    Type: String
+    Description: "Slack endpoint URL."
+    Default: https://this.is.a.slack.endpoint
+
+  GuardDutySNSTopicExceptions:
+    Type: String
+    Description: 'Name of the SNS topic for Lambda function exceptions.'
+    Default: guardduty-reports-exceptions
+
+  GuardDutyExceptionsSNSSubscription:
+    Type: String
+    Description: "Jira webhook for Lambda function exceptions."
+    Default: https://this.is.a.jira.endpoint
+
+  GuardDutyEventBridge:
+    Type: String
+    Description: "Event bridge rule to trigger the lambda function on a schedule."
+    Default: guardduty-reports
+
+  GuardDutyIAMRole:
+    Type: String
+    Description: "IAM role needed by the lambda function."
+    Default: guardduty-reports
+
+  GuardDutyCloudWatchGroupPrefix:
+    Type: String
+    Description: "CloudWatch Log Group prefix for the lambda function."
+    Default: /aws/lambda
+
+Resources:
+
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "${GuardDutyS3Bucket}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: false
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      VersioningConfiguration:
+        Status: "Suspended"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: Transition to Glacier after 90 days
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: Delete-Incomplete-MPU-7Days
+            Status: Enabled
+            Prefix: ''
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: Expire and delete after 7 years
+            Status: Enabled
+            Prefix: ''
+            ExpirationInDays: 2555
+            NoncurrentVersionExpiration: 
+              NoncurrentDays: 1
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "AllowCloudFrontServicePrincipal"
+            Effect: Allow
+            Principal:
+              Service: "cloudfront.amazonaws.com"
+            Action:
+              - 's3:GetObject'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceArn':
+                  Fn::Join:
+                    - "" 
+                    - 
+                      - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/"
+                      - Fn::GetAtt:
+                        - "GuardDutyCloudfrontDistribution"
+                        - "Id"
+          - Sid: "AllowSSLRequestsOnly"
+            Effect: Deny
+            Action: s3:*
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+            Principal: '*'
+            
+  GuardDutyOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Ref GuardDutyOACName
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  GuardDutyCloudfrontKey:
+    Type: AWS::CloudFront::PublicKey
+    Properties:
+      PublicKeyConfig:
+        Name: !Ref GuardDutyKeyName
+        CallerReference: !Ref AWS::StackName
+        EncodedKey: !Ref GuardDutyEcondedPublicKey
+
+  GuardDutyCloudfrontKeyGroup:
+    Type: AWS::CloudFront::KeyGroup
+    Properties:
+      KeyGroupConfig: 
+        Name: !Ref GuardDutyKeyGroupName
+        Items:
+          - !Ref GuardDutyCloudfrontKey
+
+  GuardDutyCloudfrontCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Ref GuardDutyCachePolicyName
+        DefaultTTL: 60
+        MaxTTL: 60
+        MinTTL: 60
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+
+  GuardDutyCloudfrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - Id: !Sub "${GuardDutyS3Bucket}.s3.${AWS::Region}.amazonaws.com"
+            DomainName: !Sub "${GuardDutyS3Bucket}.s3.${AWS::Region}.amazonaws.com"
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !Ref GuardDutyOriginAccessControl
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub "${GuardDutyS3Bucket}.s3.${AWS::Region}.amazonaws.com"
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - HEAD
+            - GET
+          CachedMethods:
+            - HEAD
+            - GET
+          Compress: true
+          CachePolicyId: !GetAtt GuardDutyCloudfrontCachePolicy.Id
+          TrustedKeyGroups: 
+            - !GetAtt GuardDutyCloudfrontKeyGroup.Id
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_All
+
+  SnsTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        - Endpoint: !Ref GuardDutySNSSubscription1
+          Protocol: "email"
+        - Endpoint: !Ref GuardDutySNSSubscription2
+          Protocol: "email"
+        - Endpoint: !Ref GuardDutySNSSubscription3
+          Protocol: "https" 
+      TopicName: !Ref GuardDutySNSTopic
+
+  SnsTopicExceptions:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        - Endpoint: !Ref GuardDutyExceptionsSNSSubscription
+          Protocol: "https"
+      TopicName: !Ref GuardDutySNSTopicExceptions
+
+  MyReportsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: 
+        Fn::Join:
+          - ""
+          - 
+            - !Ref GuardDutyCloudWatchGroupPrefix
+            - "/"
+            - !Ref GuardDutyLambda
+      RetentionInDays: 90
+
+  IAMLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Ref GuardDutyIAMRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'lambda.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/AWSSecurityHubReadOnlyAccess'
+      Policies:
+      - PolicyName: GuardDuty-Reports-LambdaBasicExecutionRole
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: "logs:CreateLogGroup"
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:logs:*:*:log-group:${GuardDutyCloudWatchGroupPrefix}/${GuardDutyLambda}:*'
+      - PolicyName: GuardDuty-Reports-SNS-Publish
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "sns:Publish"
+            Resource: "arn:aws:sns:*:*:*"
+      - PolicyName: GuardDuty-Reports-S3-Access
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: "VisualEditor0"
+            Effect: "Allow"
+            Action:
+              - "s3:PutObject"
+              - "s3:GetObject"
+              - "s3:ListBucketMultipartUploads"
+              - "s3:DeleteObjectVersion"
+              - "s3:ListBucketVersions"
+              - "s3:GetObjectAttributes"
+              - "s3:ListBucket"
+              - "s3:PutObjectTagging"
+              - "s3:DeleteObject"
+              - "s3:GetBucketAcl"
+              - "s3:ListMultipartUploadParts"
+            Resource: 
+              - !Sub 'arn:${AWS::Partition}:s3:::${GuardDutyS3Bucket}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${GuardDutyS3Bucket}'
+          - Sid: "VisualEditor1"
+            Effect: "Allow"
+            Action:
+              - "s3:ListStorageLensConfigurations"
+              - "s3:ListAccessPointsForObjectLambda"
+              - "s3:ListAllMyBuckets"
+              - "s3:ListAccessPoints"
+              - "s3:ListJobs"
+              - "s3:ListMultiRegionAccessPoints"
+            Resource: "*"
+      - PolicyName: GuardDuty-Reports-Org-Access
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: "organizations:DescribeAccount"
+            Resource: "*"
+
+  LambdaGuardDutyReports:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Ref GuardDutyLambda
+      Description: "AWS function used to generate GuardDuty findings reports in S3 bucket. The report collects all data from GuardDuty"
+      Code:
+        ZipFile: | 
+          # Source of the initial work here: https://github.com/ykbryan/lambda-get-securityhub-findings
+
+          import json
+          import boto3
+          import botocore
+          import csv
+          import os
+
+          sns = boto3.client('sns')
+          securityhub = boto3.client('securityhub')
+          s3 = boto3.resource('s3')
+          org_client = boto3.client('organizations')  # AWS Organizations client to get account details
+
+          _filter = {
+              'ProductName': [
+                  {
+                      'Value': 'GuardDuty',
+                      'Comparison': 'EQUALS'
+                  }
+              ],
+            #  'ComplianceStatus': [
+            #      {
+            #          'Value': 'FAILED',
+            #          'Comparison': 'EQUALS'
+            #      }
+            #  ],
+              'RecordState': [
+                  {
+                      'Value': 'ACTIVE',
+                      'Comparison': 'EQUALS'
+                  }
+              ],
+              'WorkflowStatus': [
+                  {
+                      'Value': 'SUPPRESSED',
+                      'Comparison': 'NOT_EQUALS'
+                  },
+                  {
+                      'Value': 'RESOLVED',
+                      'Comparison': 'NOT_EQUALS'
+                  }
+              ],
+          #  'GeneratorId': [
+            #      {
+            #          'Value': 'aws-foundation',
+            #          'Comparison': 'PREFIX'
+            #      }
+            #  ],
+          }
+
+          _sort = [
+              {
+                  'Field': 'ComplianceStatus',
+                  'SortOrder': 'desc'
+              },
+              {
+                  'Field': 'SeverityNormalized',
+                  'SortOrder': 'desc'
+              }
+          ]
+
+          MAX_ITEMS = 100
+
+          # Cache for account names to avoid redundant API calls
+          account_name_cache = {}
+
+          def get_account_name(account_id):
+              # Check cache first
+              if account_id in account_name_cache:
+                  return account_name_cache[account_id]
+              
+              try:
+                  response = org_client.describe_account(AccountId=account_id)
+                  account_name = response['Account']['Name']
+                  account_name_cache[account_id] = account_name  # Cache the account name
+                  return account_name
+              except Exception as e:
+                  print(f"Error fetching account name for {account_id}: {e}")
+                  return account_id
+
+          def lambda_handler(event, context):
+              result = securityhub.get_findings(
+                Filters=_filter,
+                SortCriteria=_sort,
+                MaxResults=MAX_ITEMS
+              )
+
+              from datetime import datetime
+              current_datetime = datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
+              current_date = datetime.now().strftime('%d-%m-%Y')
+              current_time = datetime.now().strftime('%H:%M:%S')
+              print("Current date & time : ", current_datetime)
+              print("Current date : ", current_date)
+              print("Current time : ", current_time)
+              BUCKET_NAME = os.environ['BucketName'] 
+              timestamped_key = current_datetime + "-GuardDuty_Findings.csv"
+              latest_key = "GuardDuty_Findings_Latest.csv"
+              date_time_key = "GuardDuty_Findings_Latest_Date_Time.csv"
+              
+              all_findings = []
+              
+              # Generate the first file that contains all data
+              with open("/tmp/guarddutyreport.csv", "w", newline='', encoding='utf-8') as file:
+                  csv_file = csv.writer(file)
+                  
+                  keys = []
+                  count = 0
+                  while result:
+                      findings = result['Findings']
+                      current_batch = []
+                      for finding in findings: 
+                          # print("Finding Structure:", json.dumps(finding, indent=2))  # Print raw finding
+                          count += 1
+                          account_id = finding['AwsAccountId']
+                          account_name = get_account_name(account_id)
+                          item = {}
+                          item['Standard'] = finding['GeneratorId']
+                          item['Severity'] = finding['Severity']['Label']
+                          item['Title'] = finding['Title']
+                          item['AccountId'] = account_id
+                          item['AccountName'] = account_name
+                          item['ResourceType'] = finding['Resources'][0]['Type']
+                          item['ResourceId'] = finding['Resources'][0]['Id']
+                          item['Description'] = finding['Description']
+                          item['FirstObserved'] = finding.get('FirstObservedAt', 'N/A')
+                          item['LastObserved'] = finding.get('LastObservedAt', 'N/A')
+                          item['Created'] = finding.get('CreatedAt', 'N/A')
+                          item['Updated'] = finding.get('UpdatedAt', 'N/A')
+                          item['json'] = finding 
+                          # print("Item to be added:", json.dumps(item, indent=2))  # Print the item
+                          current_batch.append(item)
+
+                          if not keys:
+                              keys = list(item.keys())
+                              csv_file.writerow(keys)
+
+                      for d in current_batch:
+                          csv_file.writerow(list(d.values()))
+
+                      all_findings.extend(current_batch)
+                      # print("All Findings so far:", json.dumps(all_findings, indent=2))  # Print current state of all_findings
+                      if "NextToken" in result:
+                          token = result['NextToken']
+                          result = securityhub.get_findings(Filters=_filter, SortCriteria=_sort, MaxResults=MAX_ITEMS, NextToken=token)
+                      else:
+                          result = None
+              
+              csv_binary = open('/tmp/guarddutyreport.csv', 'rb').read()
+              
+              # Upload the first file
+              try:
+                  obj = s3.Object(BUCKET_NAME, timestamped_key)
+                  obj.put(Body=csv_binary, ContentType='text/csv')
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] == "404":
+                      print("The object does not exist.")
+                  else:
+                      raise
+
+              ### Debug
+              #print("All Findings:", json.dumps(all_findings, indent=2))
+
+              ### Generate the second file with fixed name for Confluence
+              with open("/tmp/guarddutylatest.csv", "w", newline='', encoding='utf-8') as latest_file:
+                  csv_latest = csv.writer(latest_file)
+                  
+                  keys = []
+                  count = 0
+                  for finding in all_findings:
+                      account_id = finding['AccountId']
+                      account_name = finding['AccountName']
+                      item = {}
+                      #item['Standard'] = finding['Standard']
+                      item['AccountId'] = account_id
+                      item['AccountName'] = account_name
+                      item['Severity'] = finding['Severity']
+                      item['Title'] = finding['Title']
+                      item['Description'] = finding['Description']
+                      item['ResourceType'] = finding['ResourceType']
+                      item['ResourceId'] = finding['ResourceId']
+                      item['FirstObserved'] = finding.get('FirstObserved', 'N/A')
+                      item['LastObserved'] = finding.get('LastObserved', 'N/A')
+                      item['Created'] = finding.get('Created', 'N/A')
+                      item['Updated'] = finding.get('Updated', 'N/A')
+                      # item['json'] = finding['json']
+                      
+                      if not keys:
+                          keys = list(item.keys())
+                          csv_latest.writerow(keys)
+                      
+                      csv_latest.writerow(list(item.values()))
+              
+              latest_csv_binary = open('/tmp/guarddutylatest.csv', 'rb').read()
+              
+              # Upload the second file with fixed name for Confluence
+              try:
+                  obj_latest = s3.Object(BUCKET_NAME, latest_key)
+                  obj_latest.put(Body=latest_csv_binary, ContentType='text/csv')
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] == "404":
+                      print("The object does not exist.")
+                  else:
+                      raise
+
+              ### Generate the third file to get date/time execution in Confluence
+              with open("/tmp/date-time.csv", "w", newline='', encoding='utf-8') as date_file:
+                  csv_datetime = csv.writer(date_file)
+                  
+                  # Write a single line with the current execution date and time
+                  csv_datetime.writerow(["Latest UTC Execution Date", "Latest UTC Execution Time"])
+                  csv_datetime.writerow([current_date, current_time])
+
+              date_csv_binary = open('/tmp/date-time.csv', 'rb').read()
+              
+              # Upload the date-time CSV file
+              try:
+                  obj_datetime = s3.Object(BUCKET_NAME, date_time_key)
+                  obj_datetime.put(Body=date_csv_binary, ContentType='text/csv')
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] == "404":
+                      print("The object does not exist.")
+                  else:
+                      raise
+
+              s3client = boto3.client('s3')
+              try:
+                  download_url = s3client.generate_presigned_url(
+                      'get_object',
+                      Params={
+                          'Bucket': BUCKET_NAME,
+                          'Key': timestamped_key
+                      },
+                      ExpiresIn=43200
+                  )
+                  print('Download URL:', download_url)
+                  confluence_page_url = "https://confluence.page.url/guardduty"
+                  
+                  message = (
+                      f"Hey there, a new SecurityHub report is available.\n\n"
+                      f"Click on the following link to view it in Confluence and to download it: {confluence_page_url}.\n\n"
+                  )
+                  response = sns.publish(
+                      TopicArn=os.environ['SnsTopicArn'],
+                      Subject="New GuardDuty report.",
+                      Message=message
+                  )
+                  return {
+                      "csv_link": download_url,
+                      "total": count
+                  }
+              except Exception as e:
+                  print ("Lambda execution failed: ", e)
+                  raise
+      Handler: "index.lambda_handler"
+      Environment:
+       Variables:
+          SnsTopicArn: !Ref SnsTopic
+          BucketName: !Ref S3Bucket
+      MemorySize: 512
+      Role: 
+        Fn::GetAtt:
+        - IAMLambdaRole
+        - Arn
+      Runtime: "python3.13"
+      Timeout: 600
+
+  LambdaVersionGuardDutyReports:
+      Type: AWS::Lambda::Version
+      DependsOn: LambdaGuardDutyReports
+      Properties:
+        FunctionName: !Ref GuardDutyLambda
+
+  LambdaDestinationExceptions:
+    Type: AWS::Lambda::EventInvokeConfig
+    DependsOn: LambdaGuardDutyReports
+    Properties:
+      DestinationConfig:
+          OnFailure:
+            Destination: !Ref SnsTopicExceptions
+      FunctionName: !Ref GuardDutyLambda
+      MaximumEventAgeInSeconds: 3600
+      MaximumRetryAttempts: 2
+      Qualifier: $LATEST
+
+  GuardDutyReportsRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Ref GuardDutyEventBridge
+      Description: "Triggers lambda function on a schedule to create Amazon GuardDuty reports"
+      EventBusName: default
+      ScheduleExpression: "cron(10 21 * * ? *)"
+      State: "ENABLED"
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+            - LambdaGuardDutyReports
+            - Arn
+          Id: "GuardDutyLambdaTarget"
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "LambdaGuardDutyReports"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+        - GuardDutyReportsRule
+        - Arn

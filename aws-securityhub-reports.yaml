@@ -1,22 +1,22 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Creates a lambda that generates an AWS SecurityHub repot once a week and sends an email with a link to download it. The link expires after 12 hours."
+Description: "Creates a lambda that generates an AWS SecurityHub CSPM repot on a schedule. The report is shared via CloudFront and browsable in Confluence."
 
 Parameters:
 
   SecurityHubS3Bucket:
     Type: String
     Description: "Name of the S3 bucket in which the output will be saved."
-    Default: aws-securityhub-reports
+    Default: securityhub-reports
 
   SecurityHubOACName:
     Type: String
     Description: "Name of the Origin Access Control."
-    Default: securityhub-report
+    Default: securityhub-reports
 
   SecurityHubKeyName:
     Type: String
     Description: "Name of the CloudFront Key."
-    Default: securityhub-report
+    Default: securityhub-reports
 
   SecurityHubEcondedPublicKey:
     Type: String
@@ -35,12 +35,12 @@ Parameters:
   SecurityHubKeyGroupName:
     Type: String
     Description: "Name of the CloudFront Key Group."
-    Default: securityhub-report
+    Default: securityhub-reports
 
   SecurityHubCachePolicyName:
     Type: String
     Description: "Name of the CloudFront Cache Policy."
-    Default: securityhub-report
+    Default: securityhub-reports
 
   SecurityHubLambda:
     Type: String
@@ -69,12 +69,12 @@ Parameters:
 
   SecurityHubSNSTopicExceptions:
     Type: String
-    Description: Name of the SNS topic for Lambda function exceptions
+    Description: "Name of the SNS topic for Lambda function exceptions."
     Default: securityhub-reports-exceptions
 
   SecurityHubExceptionsSNSSubscription:
     Type: String
-    Description: Slack/Jira webhook for Lambda function exceptions
+    Description: "Jira webhook for Lambda function exceptions."
     Default: https://this.is.a.jira.endpoint
 
   SecurityHubEventBridge:
@@ -97,7 +97,7 @@ Resources:
   S3Bucket:
     Type: "AWS::S3::Bucket"
     Properties:
-      BucketName: !Ref SecurityHubS3Bucket
+      BucketName: !Sub "${SecurityHubS3Bucket}-${AWS::AccountId}-${AWS::Region}"
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - BucketKeyEnabled: false
@@ -138,17 +138,27 @@ Resources:
             Action:
               - 's3:GetObject'
             Resource:
-              - !Sub 'arn:aws:s3:::${S3Bucket}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}/*'
             Condition:
               StringEquals:
                 'aws:SourceArn':
                   Fn::Join:
                     - "" 
                     - 
-                      - !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/"
+                      - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/"
                       - Fn::GetAtt:
                         - "SecurityHubCloudfrontDistribution"
                         - "Id"
+          - Sid: "AllowSSLRequestsOnly"
+            Effect: Deny
+            Action: s3:*
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+            Principal: '*'
 
   SecurityHubOriginAccessControl:
     Type: AWS::CloudFront::OriginAccessControl
@@ -283,7 +293,7 @@ Resources:
               - "logs:CreateLogStream"
               - "logs:PutLogEvents"
             Resource:
-              - !Sub 'arn:aws:logs:*:*:log-group:${SecurityHubCloudWatchGroupPrefix}/${SecurityHubLambda}:*'
+              - !Sub 'arn:${AWS::Partition}:logs:*:*:log-group:${SecurityHubCloudWatchGroupPrefix}/${SecurityHubLambda}:*'
       - PolicyName: SecurityHub-Reports-SNS-Publish
         PolicyDocument:
           Version: "2012-10-17"
@@ -311,8 +321,8 @@ Resources:
               - "s3:GetBucketAcl"
               - "s3:ListMultipartUploadParts"
             Resource: 
-              - !Sub 'arn:aws:s3:::${SecurityHubS3Bucket}/*'
-              - !Sub 'arn:aws:s3:::${SecurityHubS3Bucket}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${SecurityHubS3Bucket}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${SecurityHubS3Bucket}'
           - Sid: "VisualEditor1"
             Effect: "Allow"
             Action:
@@ -374,9 +384,7 @@ Resources:
                   {
                       'Value': 'SUPPRESSED',
                       'Comparison': 'NOT_EQUALS'
-                  }
-              ],
-              'WorkflowStatus': [
+                  },
                   {
                       'Value': 'RESOLVED',
                       'Comparison': 'NOT_EQUALS'
@@ -455,6 +463,7 @@ Resources:
                           count += 1
                           account_id = finding['AwsAccountId']
                           account_name = get_account_name(account_id)
+                          resource = finding['Resources'][0]
                           item = {}
                           item['AccountId'] = account_id
                           item['AccountName'] = account_name
@@ -466,6 +475,11 @@ Resources:
                           item['Description'] = finding['Description']
                           item['ResourceType'] = finding['Resources'][0]['Type']
                           item['ResourceId'] = finding['Resources'][0]['Id']
+                          tags = resource.get('Tags', {})
+                          resource_name = tags.get('Name') or tags.get('name')
+                          if not resource_name:
+                              resource_name = resource.get('Details', {}).get('Other', {}).get('Name', 'No Name tag, see ARN.')
+                          item['ResourceName'] = resource_name
                           item['Remediation'] = finding['Remediation']['Recommendation']['Url']
                           item['Standard'] = finding['GeneratorId']
                           item['FirstObserved'] = finding.get('FirstObservedAt', 'N/A')
@@ -551,7 +565,7 @@ Resources:
                   )
                   response = sns.publish(
                       TopicArn = os.environ ['SnsTopicArn'] ,
-                      Subject = "New weekly SecurityHub report.",
+                      Subject = "New SecurityHub report.",
                       Message = message
                       )
                   return {
@@ -598,7 +612,7 @@ Resources:
       Name: !Ref SecurityHubEventBridge
       Description: "Triggers lambda function on a schedule to create Amazon SecurityHub reports"
       EventBusName: default
-      ScheduleExpression: "cron(0 21 ? * 1 *)"
+      ScheduleExpression: "cron(10 21 * * ? *)"
       State: "ENABLED"
       Targets:
         - Arn:
